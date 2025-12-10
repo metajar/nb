@@ -1,0 +1,1295 @@
+#!/usr/bin/env bash
+###############################################################################
+# ai.nb-plugin
+#
+# An AI plugin for `nb` providing semantic search and question-answering
+# capabilities using OpenAI (or compatible APIs).
+#
+# Features:
+#   - Semantic search across notes using embeddings
+#   - Ask questions about your notes (RAG - Retrieval Augmented Generation)
+#   - Summarize notes
+#   - Efficient index-based embedding storage
+#
+# Requirements:
+#   - curl
+#   - jq (for JSON parsing)
+#   - OpenAI API key (set via NB_OPENAI_API_KEY or `nb ai config set api_key`)
+#
+# Install with:
+#   nb plugin install https://github.com/xwmx/nb/blob/master/plugins/ai.nb-plugin
+#
+# https://github.com/xwmx/nb
+###############################################################################
+
+# Add the new subcommand name with `_subcommands add <name>`.
+_subcommands add "ai"
+
+# Define help and usage text with `_subcommands describe <subcommand> <usage>`.
+_subcommands describe "ai" <<HEREDOC
+Usage:
+  nb ai index [--rebuild] [--status]
+  nb ai ask <question> [--model <model>] [-n <num>]
+  nb ai search <query> [-n <num>] [--threshold <0.0-1.0>]
+  nb ai summarize [<notebook>:][<id> | <filename> | <title>]
+  nb ai chat [--model <model>]
+  nb ai config [show | set <key> <value>]
+
+Subcommands:
+  index     Build or update the embeddings index for fast semantic search.
+  ask       Ask a question about your notes using AI (RAG).
+  search    Semantic search across notes using embeddings.
+  summarize Generate an AI summary of a note or all notes.
+  chat      Start an interactive chat session about your notes.
+  config    View or set AI configuration (api_key, model, base_url).
+
+Options:
+  --model <model>       Specify the model to use (default: gpt-4o-mini).
+  -n, --num <number>    Number of results to return (default: 5).
+  --threshold <float>   Minimum similarity threshold for search (0.0-1.0).
+  --rebuild             Force rebuild of the entire index.
+  --status              Show index status without updating.
+
+Configuration:
+  Set your OpenAI API key using one of these methods:
+    1. Environment variable: export NB_OPENAI_API_KEY="sk-..."
+    2. nb config: nb ai config set api_key "sk-..."
+
+  Optional settings:
+    - base_url: Custom API endpoint (for OpenAI-compatible APIs)
+    - model: Default model for chat/ask commands
+    - embedding_model: Model for embeddings (default: text-embedding-3-small)
+
+Examples:
+  # Build/update the embeddings index (run after adding notes)
+  nb ai index
+
+  # Search notes semantically (uses pre-built index)
+  nb ai search "meeting notes about project planning"
+
+  # Ask a question about your notes
+  nb ai ask "What were the action items from last week's meeting?"
+
+  # Summarize a specific note
+  nb ai summarize 42
+
+  # Configure API key
+  nb ai config set api_key "sk-your-api-key-here"
+
+  # View current configuration
+  nb ai config show
+HEREDOC
+
+###############################################################################
+# Configuration
+###############################################################################
+
+# Default values
+_AI_DEFAULT_MODEL="gpt-4o-mini"
+_AI_DEFAULT_EMBEDDING_MODEL="text-embedding-3-small"
+_AI_DEFAULT_BASE_URL="https://api.openai.com/v1"
+_AI_DEFAULT_NUM_RESULTS=5
+_AI_DEFAULT_THRESHOLD="0.5"
+_AI_CONFIG_FILE="${NB_DIR}/.ai_config"
+_AI_INDEX_FILE="${NB_DIR}/.ai_index.json"
+
+###############################################################################
+# Helper Functions
+###############################################################################
+
+# _ai_check_dependencies()
+#
+# Check if required dependencies are installed.
+_ai_check_dependencies() {
+  if ! _command_exists "curl"
+  then
+    _exit_1 printf "curl is required but not installed.\\n"
+  fi
+
+  if ! _command_exists "jq"
+  then
+    _exit_1 printf "jq is required but not installed.\\nInstall with: brew install jq (macOS) or apt install jq (Linux)\\n"
+  fi
+}
+
+# _ai_get_config()
+#
+# Usage:
+#   _ai_get_config <key>
+#
+# Get a configuration value.
+_ai_get_config() {
+  local _key="${1:-}"
+
+  if [[ -z "${_key}" ]]
+  then
+    return 1
+  fi
+
+  # Check environment variable first
+  case "${_key}" in
+    api_key)
+      if [[ -n "${NB_OPENAI_API_KEY:-}" ]]
+      then
+        printf "%s" "${NB_OPENAI_API_KEY}"
+        return 0
+      fi
+      ;;
+    base_url)
+      if [[ -n "${NB_OPENAI_BASE_URL:-}" ]]
+      then
+        printf "%s" "${NB_OPENAI_BASE_URL}"
+        return 0
+      fi
+      ;;
+    model)
+      if [[ -n "${NB_OPENAI_MODEL:-}" ]]
+      then
+        printf "%s" "${NB_OPENAI_MODEL}"
+        return 0
+      fi
+      ;;
+  esac
+
+  # Check config file
+  if [[ -f "${_AI_CONFIG_FILE}" ]]
+  then
+    local _value
+    _value="$(grep "^${_key}=" "${_AI_CONFIG_FILE}" 2>/dev/null | cut -d'=' -f2-)"
+
+    if [[ -n "${_value}" ]]
+    then
+      printf "%s" "${_value}"
+      return 0
+    fi
+  fi
+
+  # Return defaults
+  case "${_key}" in
+    model)
+      printf "%s" "${_AI_DEFAULT_MODEL}"
+      ;;
+    embedding_model)
+      printf "%s" "${_AI_DEFAULT_EMBEDDING_MODEL}"
+      ;;
+    base_url)
+      printf "%s" "${_AI_DEFAULT_BASE_URL}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# _ai_set_config()
+#
+# Usage:
+#   _ai_set_config <key> <value>
+#
+# Set a configuration value.
+_ai_set_config() {
+  local _key="${1:-}"
+  local _value="${2:-}"
+
+  if [[ -z "${_key}" ]] || [[ -z "${_value}" ]]
+  then
+    return 1
+  fi
+
+  # Create config file if it doesn't exist
+  if [[ ! -f "${_AI_CONFIG_FILE}" ]]
+  then
+    touch "${_AI_CONFIG_FILE}"
+    chmod 600 "${_AI_CONFIG_FILE}"  # Secure the file (contains API key)
+  fi
+
+  # Update or add the key
+  if grep -q "^${_key}=" "${_AI_CONFIG_FILE}" 2>/dev/null
+  then
+    _sed_i "s|^${_key}=.*|${_key}=${_value}|" "${_AI_CONFIG_FILE}"
+  else
+    printf "%s=%s\\n" "${_key}" "${_value}" >> "${_AI_CONFIG_FILE}"
+  fi
+}
+
+# _ai_require_api_key()
+#
+# Ensure API key is configured.
+_ai_require_api_key() {
+  local _api_key
+  _api_key="$(_ai_get_config "api_key")"
+
+  if [[ -z "${_api_key}" ]]
+  then
+    _exit_1 cat <<HEREDOC
+OpenAI API key not configured.
+
+Set your API key using one of these methods:
+  1. Environment variable:
+     export NB_OPENAI_API_KEY="sk-your-key-here"
+
+  2. Using nb config:
+     nb ai config set api_key "sk-your-key-here"
+HEREDOC
+  fi
+}
+
+# _ai_api_request()
+#
+# Usage:
+#   _ai_api_request <endpoint> <json_body>
+#
+# Make an API request to OpenAI.
+_ai_api_request() {
+  local _endpoint="${1:-}"
+  local _json_body="${2:-}"
+
+  local _api_key
+  _api_key="$(_ai_get_config "api_key")"
+
+  local _base_url
+  _base_url="$(_ai_get_config "base_url")"
+
+  local _response
+  _response="$(
+    curl -s -w "\n%{http_code}" \
+      "${_base_url}/${_endpoint}" \
+      -H "Authorization: Bearer ${_api_key}" \
+      -H "Content-Type: application/json" \
+      -d "${_json_body}"
+  )"
+
+  local _http_code
+  _http_code="$(printf "%s" "${_response}" | tail -n1)"
+
+  local _body
+  _body="$(printf "%s" "${_response}" | sed '$d')"
+
+  if [[ "${_http_code}" != "200" ]]
+  then
+    local _error_message
+    _error_message="$(printf "%s" "${_body}" | jq -r '.error.message // "Unknown error"' 2>/dev/null)"
+
+    _exit_1 printf "API request failed (HTTP %s): %s\\n" "${_http_code}" "${_error_message}"
+  fi
+
+  printf "%s" "${_body}"
+}
+
+# _ai_get_embedding()
+#
+# Usage:
+#   _ai_get_embedding <text>
+#
+# Get embedding vector for text.
+_ai_get_embedding() {
+  local _text="${1:-}"
+
+  if [[ -z "${_text}" ]]
+  then
+    return 1
+  fi
+
+  local _model
+  _model="$(_ai_get_config "embedding_model")"
+
+  # Escape the text for JSON and truncate to ~8000 chars to stay within limits
+  local _truncated_text="${_text:0:8000}"
+  local _escaped_text
+  _escaped_text="$(printf "%s" "${_truncated_text}" | jq -Rs '.')"
+
+  local _json_body
+  _json_body="$(cat <<EOF
+{
+  "model": "${_model}",
+  "input": ${_escaped_text}
+}
+EOF
+)"
+
+  local _response
+  _response="$(_ai_api_request "embeddings" "${_json_body}")"
+
+  # Extract embedding vector
+  printf "%s" "${_response}" | jq -c '.data[0].embedding'
+}
+
+# _ai_get_embeddings_batch()
+#
+# Usage:
+#   _ai_get_embeddings_batch <texts_json_array>
+#
+# Get embeddings for multiple texts in a single API call (more efficient).
+_ai_get_embeddings_batch() {
+  local _texts_json="${1:-}"
+
+  if [[ -z "${_texts_json}" ]] || [[ "${_texts_json}" == "[]" ]]
+  then
+    printf "[]"
+    return 0
+  fi
+
+  local _model
+  _model="$(_ai_get_config "embedding_model")"
+
+  local _json_body
+  _json_body="$(cat <<EOF
+{
+  "model": "${_model}",
+  "input": ${_texts_json}
+}
+EOF
+)"
+
+  local _response
+  _response="$(_ai_api_request "embeddings" "${_json_body}")"
+
+  # Extract all embeddings
+  printf "%s" "${_response}" | jq -c '[.data | sort_by(.index) | .[].embedding]'
+}
+
+# _ai_chat_completion()
+#
+# Usage:
+#   _ai_chat_completion <system_prompt> <user_message>
+#
+# Get a chat completion from the API.
+_ai_chat_completion() {
+  local _system_prompt="${1:-}"
+  local _user_message="${2:-}"
+  local _model
+
+  _model="$(_ai_get_config "model")"
+
+  # Escape messages for JSON
+  local _escaped_system
+  _escaped_system="$(printf "%s" "${_system_prompt}" | jq -Rs '.')"
+
+  local _escaped_user
+  _escaped_user="$(printf "%s" "${_user_message}" | jq -Rs '.')"
+
+  local _json_body
+  _json_body="$(cat <<EOF
+{
+  "model": "${_model}",
+  "messages": [
+    {"role": "system", "content": ${_escaped_system}},
+    {"role": "user", "content": ${_escaped_user}}
+  ],
+  "stream": false
+}
+EOF
+)"
+
+  local _response
+  _response="$(_ai_api_request "chat/completions" "${_json_body}")"
+
+  # Extract the response content
+  printf "%s" "${_response}" | jq -r '.choices[0].message.content'
+}
+
+# _ai_cosine_similarity()
+#
+# Usage:
+#   _ai_cosine_similarity <vector1_json> <vector2_json>
+#
+# Calculate cosine similarity between two vectors.
+_ai_cosine_similarity() {
+  local _vec1="${1:-}"
+  local _vec2="${2:-}"
+
+  # Use jq to calculate cosine similarity
+  jq -n --argjson v1 "${_vec1}" --argjson v2 "${_vec2}" '
+    def dot: . as $pair | [$pair[0], $pair[1]] | transpose | map(.[0] * .[1]) | add;
+    def magnitude: . | map(. * .) | add | sqrt;
+    ([$v1, $v2] | dot) / (($v1 | magnitude) * ($v2 | magnitude))
+  '
+}
+
+# _ai_get_file_hash()
+#
+# Usage:
+#   _ai_get_file_hash <file_path>
+#
+# Get a hash of the file for change detection.
+_ai_get_file_hash() {
+  local _file="${1:-}"
+
+  if [[ -f "${_file}" ]]
+  then
+    # Use md5 for content hash (works on both macOS and Linux)
+    if _command_exists "md5sum"
+    then
+      md5sum "${_file}" 2>/dev/null | cut -d' ' -f1
+    elif _command_exists "md5"
+    then
+      md5 -q "${_file}" 2>/dev/null
+    else
+      # Fallback to file size + mtime
+      stat -f "%z-%m" "${_file}" 2>/dev/null || stat -c "%s-%Y" "${_file}" 2>/dev/null
+    fi
+  fi
+}
+
+# _ai_get_note_content()
+#
+# Usage:
+#   _ai_get_note_content <path>
+#
+# Get the content of a note file.
+_ai_get_note_content() {
+  local _path="${1:-}"
+
+  if [[ -f "${_path}" ]]
+  then
+    # Get file content, limit to first 8000 chars to avoid token limits
+    head -c 8000 "${_path}" 2>/dev/null || cat "${_path}"
+  fi
+}
+
+# _ai_get_all_notes()
+#
+# Usage:
+#   _ai_get_all_notes [<notebook_path>]
+#
+# Get all text/markdown notes from a notebook.
+_ai_get_all_notes() {
+  local _notebook_path="${1:-}"
+
+  if [[ -z "${_notebook_path}" ]]
+  then
+    _notebook_path="$(_notebooks current --path)"
+  fi
+
+  # Find all text files (md, txt, org, etc.)
+  find "${_notebook_path}" \
+    -type f \
+    \( -name "*.md" -o -name "*.txt" -o -name "*.org" -o -name "*.markdown" -o -name "*.rst" \) \
+    ! -path "*/.git/*" \
+    ! -name ".ai_*" \
+    2>/dev/null
+}
+
+###############################################################################
+# Index Management
+###############################################################################
+
+# _ai_index_exists()
+#
+# Check if index file exists and is valid.
+_ai_index_exists() {
+  [[ -f "${_AI_INDEX_FILE}" ]] && jq -e '.version' "${_AI_INDEX_FILE}" &>/dev/null
+}
+
+# _ai_load_index()
+#
+# Load the index into memory (outputs to stdout).
+_ai_load_index() {
+  if [[ -f "${_AI_INDEX_FILE}" ]]
+  then
+    cat "${_AI_INDEX_FILE}"
+  else
+    printf '{"version":1,"notebook":"","entries":{}}'
+  fi
+}
+
+# _ai_save_index()
+#
+# Usage:
+#   _ai_save_index <index_json>
+#
+# Save the index to disk.
+_ai_save_index() {
+  local _index="${1:-}"
+  printf "%s" "${_index}" | jq '.' > "${_AI_INDEX_FILE}"
+}
+
+# _ai_index_status()
+#
+# Show current index status.
+_ai_index_status() {
+  local _notebook_path
+  _notebook_path="$(_notebooks current --path)"
+
+  printf "%s\\n" "$(_color_primary "Index Status:")"
+  printf "%s\\n" "$(_color_muted "─────────────────────────────────────────")"
+
+  if ! _ai_index_exists
+  then
+    printf "Index: %s\\n" "$(_color_muted "Not created")"
+    printf "\\nRun %s to build the index.\\n" "$(_color_primary "nb ai index")"
+    return 0
+  fi
+
+  local _index
+  _index="$(_ai_load_index)"
+
+  local _indexed_count
+  _indexed_count="$(printf "%s" "${_index}" | jq '.entries | length')"
+
+  local _indexed_notebook
+  _indexed_notebook="$(printf "%s" "${_index}" | jq -r '.notebook')"
+
+  local _last_updated
+  _last_updated="$(printf "%s" "${_index}" | jq -r '.updated_at // "Unknown"')"
+
+  # Count current notes
+  local _current_count
+  _current_count="$(_ai_get_all_notes "${_notebook_path}" | wc -l | tr -d ' ')"
+
+  printf "Index file:     %s\\n" "${_AI_INDEX_FILE}"
+  printf "Indexed notes:  %s\\n" "${_indexed_count}"
+  printf "Current notes:  %s\\n" "${_current_count}"
+  printf "Last updated:   %s\\n" "${_last_updated}"
+
+  # Check for changes
+  local _needs_update=0
+  local _new_count=0
+  local _changed_count=0
+  local _deleted_count=0
+
+  while IFS= read -r _note_path
+  do
+    [[ -z "${_note_path}" ]] && continue
+
+    local _relative_path="${_note_path#${_notebook_path}/}"
+    local _current_hash
+    _current_hash="$(_ai_get_file_hash "${_note_path}")"
+
+    local _indexed_hash
+    _indexed_hash="$(printf "%s" "${_index}" | jq -r --arg path "${_relative_path}" '.entries[$path].hash // ""')"
+
+    if [[ -z "${_indexed_hash}" ]]
+    then
+      _new_count=$((_new_count + 1))
+      _needs_update=1
+    elif [[ "${_current_hash}" != "${_indexed_hash}" ]]
+    then
+      _changed_count=$((_changed_count + 1))
+      _needs_update=1
+    fi
+  done < <(_ai_get_all_notes "${_notebook_path}")
+
+  # Check for deleted files
+  _deleted_count="$(printf "%s" "${_index}" | jq --arg nb "${_notebook_path}" '
+    [.entries | keys[] | select(. as $k | ($nb + "/" + $k) | (. | test("^/") | not) or (. | @sh | system("test -f " + .) | . != 0))] | length
+  ' 2>/dev/null || echo "0")"
+
+  printf "\\n%s\\n" "$(_color_primary "Changes detected:")"
+  printf "  New notes:     %s\\n" "${_new_count}"
+  printf "  Modified:      %s\\n" "${_changed_count}"
+
+  if ((_needs_update)) || [[ "${_new_count}" -gt 0 ]] || [[ "${_changed_count}" -gt 0 ]]
+  then
+    printf "\\nRun %s to update the index.\\n" "$(_color_primary "nb ai index")"
+  else
+    printf "\\n%s Index is up to date.\\n" "$(_color_secondary "✓")"
+  fi
+}
+
+# _ai_build_index()
+#
+# Build or update the embeddings index.
+_ai_build_index() {
+  local _rebuild=0
+
+  while ((${#}))
+  do
+    case "${1:-}" in
+      --rebuild)
+        _rebuild=1
+        ;;
+      --status)
+        _ai_index_status
+        return 0
+        ;;
+    esac
+    shift
+  done
+
+  _ai_check_dependencies
+  _ai_require_api_key
+
+  local _notebook_path
+  _notebook_path="$(_notebooks current --path)"
+
+  printf "%s\\n" "$(_color_primary "Building AI Index")"
+  printf "%s\\n\\n" "$(_color_muted "─────────────────────────────────────────")"
+
+  # Load existing index or create new one
+  local _index
+  if ((_rebuild)) || ! _ai_index_exists
+  then
+    _index='{"version":1,"notebook":"'"${_notebook_path}"'","entries":{}}'
+    printf "Creating new index%s\\n" "$(_color_muted "...")"
+  else
+    _index="$(_ai_load_index)"
+    printf "Updating existing index%s\\n" "$(_color_muted "...")"
+  fi
+
+  # Collect files that need embedding
+  local _files_to_embed=()
+  local _paths_to_embed=()
+  local _unchanged_count=0
+  local _total_notes=0
+
+  while IFS= read -r _note_path
+  do
+    [[ -z "${_note_path}" ]] && continue
+    _total_notes=$((_total_notes + 1))
+
+    local _relative_path="${_note_path#${_notebook_path}/}"
+    local _current_hash
+    _current_hash="$(_ai_get_file_hash "${_note_path}")"
+
+    # Check if already indexed with same hash
+    local _indexed_hash
+    _indexed_hash="$(printf "%s" "${_index}" | jq -r --arg path "${_relative_path}" '.entries[$path].hash // ""')"
+
+    if [[ "${_current_hash}" == "${_indexed_hash}" ]] && ! ((_rebuild))
+    then
+      _unchanged_count=$((_unchanged_count + 1))
+    else
+      local _content
+      _content="$(_ai_get_note_content "${_note_path}")"
+
+      if [[ -n "${_content}" ]]
+      then
+        _files_to_embed+=("${_content}")
+        _paths_to_embed+=("${_relative_path}|${_current_hash}|${_note_path}")
+      fi
+    fi
+  done < <(_ai_get_all_notes "${_notebook_path}")
+
+  printf "Total notes:     %s\\n" "${_total_notes}"
+  printf "Unchanged:       %s\\n" "${_unchanged_count}"
+  printf "To embed:        %s\\n\\n" "${#_files_to_embed[@]}"
+
+  if [[ ${#_files_to_embed[@]} -eq 0 ]]
+  then
+    printf "%s Index is up to date.\\n" "$(_color_secondary "✓")"
+    return 0
+  fi
+
+  # Process in batches of 20 (API limit considerations)
+  local _batch_size=20
+  local _processed=0
+
+  while [[ ${_processed} -lt ${#_files_to_embed[@]} ]]
+  do
+    local _batch_end=$((_processed + _batch_size))
+    [[ ${_batch_end} -gt ${#_files_to_embed[@]} ]] && _batch_end=${#_files_to_embed[@]}
+
+    printf "\\rProcessing notes %s-%s of %s%s" \
+      "$((_processed + 1))" "${_batch_end}" "${#_files_to_embed[@]}" "$(_color_muted "...")"
+
+    # Build JSON array of texts for batch embedding
+    local _texts_json="["
+    local _first=1
+    for ((i=_processed; i<_batch_end; i++))
+    do
+      local _escaped_content
+      _escaped_content="$(printf "%s" "${_files_to_embed[i]:0:8000}" | jq -Rs '.')"
+
+      if ((_first))
+      then
+        _texts_json="${_texts_json}${_escaped_content}"
+        _first=0
+      else
+        _texts_json="${_texts_json},${_escaped_content}"
+      fi
+    done
+    _texts_json="${_texts_json}]"
+
+    # Get embeddings for batch
+    local _embeddings
+    _embeddings="$(_ai_get_embeddings_batch "${_texts_json}")"
+
+    # Update index with new embeddings
+    for ((i=_processed; i<_batch_end; i++))
+    do
+      local _batch_idx=$((i - _processed))
+      local _path_info="${_paths_to_embed[i]}"
+      local _relative_path="${_path_info%%|*}"
+      local _rest="${_path_info#*|}"
+      local _hash="${_rest%%|*}"
+
+      local _embedding
+      _embedding="$(printf "%s" "${_embeddings}" | jq -c ".[${_batch_idx}]")"
+
+      # Get title from first line
+      local _full_path="${_rest#*|}"
+      local _title
+      _title="$(head -n 5 "${_full_path}" 2>/dev/null | grep -m1 "^#" | sed 's/^#* *//' || basename "${_relative_path}")"
+      _title="$(printf "%s" "${_title}" | jq -Rs '.' | jq -r '.')"
+
+      # Update index
+      _index="$(printf "%s" "${_index}" | jq --arg path "${_relative_path}" \
+        --arg hash "${_hash}" \
+        --arg title "${_title}" \
+        --argjson embedding "${_embedding}" \
+        '.entries[$path] = {"hash": $hash, "title": $title, "embedding": $embedding}')"
+    done
+
+    _processed=${_batch_end}
+  done
+
+  # Update metadata
+  _index="$(printf "%s" "${_index}" | jq --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg notebook "${_notebook_path}" \
+    '.updated_at = $time | .notebook = $notebook')"
+
+  # Save index
+  _ai_save_index "${_index}"
+
+  local _final_count
+  _final_count="$(printf "%s" "${_index}" | jq '.entries | length')"
+
+  printf "\\r                                                    \\r"
+  printf "%s Index built successfully!\\n" "$(_color_secondary "✓")"
+  printf "Indexed %s notes.\\n" "${_final_count}"
+}
+
+###############################################################################
+# Subcommand Functions
+###############################################################################
+
+# _ai_config()
+#
+# Handle configuration subcommand.
+_ai_config() {
+  local _action="${1:-show}"
+
+  case "${_action}" in
+    show)
+      printf "%s\\n" "$(_color_primary "AI Configuration:")"
+      printf "  api_key:         %s\\n" "$(_ai_get_config "api_key" | sed 's/\(sk-.\{4\}\).*\(.\{4\}\)$/\1...\2/' || printf "(not set)")"
+      printf "  base_url:        %s\\n" "$(_ai_get_config "base_url")"
+      printf "  model:           %s\\n" "$(_ai_get_config "model")"
+      printf "  embedding_model: %s\\n" "$(_ai_get_config "embedding_model")"
+      ;;
+    set)
+      local _key="${2:-}"
+      local _value="${3:-}"
+
+      if [[ -z "${_key}" ]] || [[ -z "${_value}" ]]
+      then
+        _exit_1 printf "Usage: nb ai config set <key> <value>\\n"
+      fi
+
+      case "${_key}" in
+        api_key|base_url|model|embedding_model)
+          _ai_set_config "${_key}" "${_value}"
+          printf "Set %s successfully.\\n" "$(_color_primary "${_key}")"
+          ;;
+        *)
+          _exit_1 printf "Unknown config key: %s\\nValid keys: api_key, base_url, model, embedding_model\\n" "${_key}"
+          ;;
+      esac
+      ;;
+    *)
+      _exit_1 printf "Unknown config action: %s\\nUsage: nb ai config [show | set <key> <value>]\\n" "${_action}"
+      ;;
+  esac
+}
+
+# _ai_search()
+#
+# Semantic search across notes using pre-built index.
+_ai_search() {
+  local _query=
+  local _num_results="${_AI_DEFAULT_NUM_RESULTS}"
+  local _threshold="${_AI_DEFAULT_THRESHOLD}"
+
+  while ((${#}))
+  do
+    case "${1:-}" in
+      -n|--num)
+        _num_results="${2:-${_AI_DEFAULT_NUM_RESULTS}}"
+        shift
+        ;;
+      --threshold)
+        _threshold="${2:-${_AI_DEFAULT_THRESHOLD}}"
+        shift
+        ;;
+      *)
+        if [[ -z "${_query}" ]]
+        then
+          _query="${1:-}"
+        else
+          _query="${_query} ${1:-}"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${_query}" ]]
+  then
+    _exit_1 printf "Usage: nb ai search <query>\\n"
+  fi
+
+  _ai_check_dependencies
+  _ai_require_api_key
+
+  # Check if index exists
+  if ! _ai_index_exists
+  then
+    _exit_1 cat <<HEREDOC
+No embeddings index found.
+
+Build the index first with:
+  nb ai index
+
+This only needs to be done once (and updated when you add new notes).
+HEREDOC
+  fi
+
+  printf "Searching: %s\\n\\n" "$(_color_primary "${_query}")"
+
+  # Get embedding for query
+  local _query_embedding
+  _query_embedding="$(_ai_get_embedding "${_query}")"
+
+  # Load the index (single file read)
+  local _index
+  _index="$(_ai_load_index)"
+
+  local _notebook_path
+  _notebook_path="$(printf "%s" "${_index}" | jq -r '.notebook')"
+
+  # Calculate similarities using jq (efficient single pass)
+  local _results
+  _results="$(printf "%s" "${_index}" | jq -c --argjson query "${_query_embedding}" --arg threshold "${_threshold}" '
+    def cosine_similarity($v1; $v2):
+      ([$v1, $v2] | transpose | map(.[0] * .[1]) | add) /
+      ((($v1 | map(. * .) | add) | sqrt) * (($v2 | map(. * .) | add) | sqrt));
+
+    [.entries | to_entries[] | {
+      path: .key,
+      title: .value.title,
+      score: cosine_similarity($query; .value.embedding)
+    }]
+    | map(select(.score >= ($threshold | tonumber)))
+    | sort_by(-.score)
+  ')"
+
+  local _result_count
+  _result_count="$(printf "%s" "${_results}" | jq 'length')"
+
+  if [[ "${_result_count}" == "0" ]]
+  then
+    printf "No matching notes found above threshold %.2f\\n" "${_threshold}"
+    printf "\\nTry lowering the threshold with: nb ai search \"%s\" --threshold 0.3\\n" "${_query}"
+    return 0
+  fi
+
+  printf "%s\\n" "$(_color_primary "Results:")"
+  printf "%s\\n\\n" "$(_color_muted "─────────────────────────────────────────")"
+
+  # Display top N results
+  printf "%s" "${_results}" | jq -r --arg num "${_num_results}" '
+    .[:($num | tonumber)][] |
+    "[\(.score | . * 100 | floor / 100)] \(.path)\n   \(.title)\n"
+  ' | while IFS= read -r line
+  do
+    if [[ "${line}" =~ ^\[ ]]
+    then
+      printf "%s %s\\n" "$(_color_primary "${line%%]*}]")" "$(_color_secondary "${line#*] }")"
+    elif [[ -n "${line}" ]]
+    then
+      printf "%s\\n\\n" "${line}"
+    fi
+  done
+}
+
+# _ai_ask()
+#
+# Ask a question about notes using RAG.
+_ai_ask() {
+  local _question=
+  local _model=
+  local _num_context="${_AI_DEFAULT_NUM_RESULTS}"
+
+  while ((${#}))
+  do
+    case "${1:-}" in
+      --model)
+        _model="${2:-}"
+        shift
+        ;;
+      -n|--num)
+        _num_context="${2:-${_AI_DEFAULT_NUM_RESULTS}}"
+        shift
+        ;;
+      *)
+        if [[ -z "${_question}" ]]
+        then
+          _question="${1:-}"
+        else
+          _question="${_question} ${1:-}"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${_question}" ]]
+  then
+    _exit_1 printf "Usage: nb ai ask <question>\\n"
+  fi
+
+  _ai_check_dependencies
+  _ai_require_api_key
+
+  # Check if index exists
+  if ! _ai_index_exists
+  then
+    _exit_1 cat <<HEREDOC
+No embeddings index found.
+
+Build the index first with:
+  nb ai index
+HEREDOC
+  fi
+
+  # Override model if specified
+  if [[ -n "${_model}" ]]
+  then
+    _ai_set_config "model" "${_model}"
+  fi
+
+  printf "Question: %s\\n\\n" "$(_color_primary "${_question}")"
+  printf "Finding relevant notes%s" "$(_color_muted "...")"
+
+  # Get query embedding
+  local _query_embedding
+  _query_embedding="$(_ai_get_embedding "${_question}")"
+
+  # Load index and find relevant notes
+  local _index
+  _index="$(_ai_load_index)"
+
+  local _notebook_path
+  _notebook_path="$(printf "%s" "${_index}" | jq -r '.notebook')"
+
+  # Get top matching notes
+  local _top_notes
+  _top_notes="$(printf "%s" "${_index}" | jq -c --argjson query "${_query_embedding}" --arg num "${_num_context}" '
+    def cosine_similarity($v1; $v2):
+      ([$v1, $v2] | transpose | map(.[0] * .[1]) | add) /
+      ((($v1 | map(. * .) | add) | sqrt) * (($v2 | map(. * .) | add) | sqrt));
+
+    [.entries | to_entries[] | {
+      path: .key,
+      score: cosine_similarity($query; .value.embedding)
+    }]
+    | sort_by(-.score)
+    | .[:($num | tonumber)]
+    | .[].path
+  ')"
+
+  # Build context from top notes
+  local _context=""
+  local _sources=()
+
+  while IFS= read -r _relative_path
+  do
+    [[ -z "${_relative_path}" ]] && continue
+
+    # Remove quotes from jq output
+    _relative_path="${_relative_path//\"/}"
+
+    local _full_path="${_notebook_path}/${_relative_path}"
+
+    if [[ -f "${_full_path}" ]]
+    then
+      local _content
+      _content="$(_ai_get_note_content "${_full_path}")"
+
+      _context="${_context}
+
+---
+Source: ${_relative_path}
+Content:
+${_content}
+---"
+      _sources+=("${_relative_path}")
+    fi
+  done <<< "${_top_notes}"
+
+  printf "\\rGenerating answer%s      \\n\\n" "$(_color_muted "...")"
+
+  if [[ -z "${_context}" ]]
+  then
+    printf "No relevant notes found to answer this question.\\n"
+    return 0
+  fi
+
+  # Build system prompt
+  local _system_prompt="You are a helpful assistant that answers questions based on the user's notes. 
+Use ONLY the information provided in the context below to answer questions. 
+If the context doesn't contain enough information to answer the question, say so.
+Be concise but thorough. Reference specific notes when relevant.
+
+CONTEXT FROM USER'S NOTES:
+${_context}"
+
+  # Get AI response
+  local _response
+  _response="$(_ai_chat_completion "${_system_prompt}" "${_question}")"
+
+  printf "%s\\n" "$(_color_primary "Answer:")"
+  printf "%s\\n\\n" "$(_color_muted "─────────────────────────────────────────")"
+  printf "%s\\n\\n" "${_response}"
+
+  printf "%s\\n" "$(_color_muted "Sources:")"
+  for _source in "${_sources[@]}"
+  do
+    printf "  • %s\\n" "$(_color_secondary "${_source}")"
+  done
+}
+
+# _ai_summarize()
+#
+# Summarize a note or all notes.
+_ai_summarize() {
+  local _selector="${1:-}"
+  local _model=
+
+  while ((${#}))
+  do
+    case "${1:-}" in
+      --model)
+        _model="${2:-}"
+        shift
+        ;;
+      *)
+        if [[ -z "${_selector}" ]] || [[ "${_selector}" == "--model" ]]
+        then
+          _selector="${1:-}"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  _ai_check_dependencies
+  _ai_require_api_key
+
+  if [[ -n "${_model}" ]]
+  then
+    _ai_set_config "model" "${_model}"
+  fi
+
+  local _notebook_path
+  _notebook_path="$(_notebooks current --path)"
+
+  local _content=""
+  local _title=""
+
+  if [[ -n "${_selector}" ]]
+  then
+    # Summarize specific note
+    local _note_path
+    _note_path="$(_show "${_selector}" --path 2>/dev/null || :)"
+
+    if [[ -z "${_note_path}" ]] || [[ ! -f "${_note_path}" ]]
+    then
+      _exit_1 printf "Note not found: %s\\n" "${_selector}"
+    fi
+
+    _content="$(_ai_get_note_content "${_note_path}")"
+    _title="$(basename "${_note_path}")"
+
+    printf "Summarizing: %s\\n\\n" "$(_color_primary "${_title}")"
+  else
+    # Summarize recent notes (last 10)
+    printf "Summarizing recent notes%s\\n\\n" "$(_color_muted "...")"
+
+    local _count=0
+    while IFS= read -r _note_path
+    do
+      [[ -z "${_note_path}" ]] && continue
+      [[ "${_count}" -ge 10 ]] && break
+
+      local _note_content
+      _note_content="$(_ai_get_note_content "${_note_path}")"
+
+      local _relative_path="${_note_path#${_notebook_path}/}"
+      _content="${_content}
+
+---
+Note: ${_relative_path}
+${_note_content}
+---"
+      _count=$((_count + 1))
+    done < <(_ai_get_all_notes "${_notebook_path}" | head -n 10)
+
+    _title="Recent Notes"
+  fi
+
+  if [[ -z "${_content}" ]]
+  then
+    printf "No content to summarize.\\n"
+    return 0
+  fi
+
+  printf "Generating summary%s\\n\\n" "$(_color_muted "...")"
+
+  local _system_prompt="You are a helpful assistant that creates concise, well-organized summaries.
+Summarize the provided content, highlighting:
+- Key points and main ideas
+- Important details and facts
+- Action items or tasks (if any)
+- Connections between related topics
+
+Keep the summary clear and organized. Use bullet points where appropriate."
+
+  local _response
+  _response="$(_ai_chat_completion "${_system_prompt}" "Please summarize the following content:
+
+${_content}")"
+
+  printf "%s\\n" "$(_color_primary "Summary:")"
+  printf "%s\\n\\n" "$(_color_muted "─────────────────────────────────────────")"
+  printf "%s\\n" "${_response}"
+}
+
+# _ai_chat()
+#
+# Interactive chat about notes.
+_ai_chat() {
+  local _model=
+
+  while ((${#}))
+  do
+    case "${1:-}" in
+      --model)
+        _model="${2:-}"
+        shift
+        ;;
+    esac
+    shift
+  done
+
+  _ai_check_dependencies
+  _ai_require_api_key
+
+  if [[ -n "${_model}" ]]
+  then
+    _ai_set_config "model" "${_model}"
+  fi
+
+  printf "%s\\n" "$(_color_primary "AI Chat Mode")"
+  printf "%s\\n" "$(_color_muted "Chat with AI about your notes. Type 'exit' or 'quit' to end.")"
+  printf "%s\\n\\n" "$(_color_muted "─────────────────────────────────────────")"
+
+  # Gather context from recent notes
+  local _notebook_path
+  _notebook_path="$(_notebooks current --path)"
+
+  local _context=""
+  local _count=0
+
+  while IFS= read -r _note_path
+  do
+    [[ -z "${_note_path}" ]] && continue
+    [[ "${_count}" -ge 5 ]] && break
+
+    local _note_content
+    _note_content="$(_ai_get_note_content "${_note_path}")"
+
+    local _relative_path="${_note_path#${_notebook_path}/}"
+    _context="${_context}
+
+---
+Note: ${_relative_path}
+${_note_content}
+---"
+    _count=$((_count + 1))
+  done < <(_ai_get_all_notes "${_notebook_path}" | head -n 5)
+
+  local _system_prompt="You are a helpful assistant that helps the user understand and work with their notes.
+You have access to some of the user's recent notes as context.
+Answer questions, help find information, suggest connections between topics, and assist with organizing thoughts.
+
+USER'S NOTES CONTEXT:
+${_context}"
+
+  while true
+  do
+    local _user_input
+    printf "%s " "$(_color_primary "You:")"
+    IFS= read -r _user_input
+
+    case "${_user_input}" in
+      exit|quit|q)
+        printf "\\nGoodbye!\\n"
+        break
+        ;;
+      "")
+        continue
+        ;;
+    esac
+
+    printf "\\n%s " "$(_color_secondary "AI:")"
+
+    local _response
+    _response="$(_ai_chat_completion "${_system_prompt}" "${_user_input}")"
+
+    printf "%s\\n\\n" "${_response}"
+  done
+}
+
+###############################################################################
+# Main Subcommand Function
+###############################################################################
+
+# _ai()
+#
+# Main entry point for the ai subcommand.
+_ai() {
+  local _subcommand="${1:-}"
+
+  if [[ -z "${_subcommand}" ]]
+  then
+    _help "ai"
+    return 0
+  fi
+
+  shift
+
+  case "${_subcommand}" in
+    index|idx|i)
+      _ai_build_index "${@}"
+      ;;
+    ask|a)
+      _ai_ask "${@}"
+      ;;
+    search|s|find)
+      _ai_search "${@}"
+      ;;
+    summarize|sum)
+      _ai_summarize "${@}"
+      ;;
+    chat|c)
+      _ai_chat "${@}"
+      ;;
+    config|conf|cfg)
+      _ai_config "${@}"
+      ;;
+    help|h|--help|-h)
+      _help "ai"
+      ;;
+    *)
+      # If it looks like a question, treat it as an ask
+      if [[ "${_subcommand}" =~ \? ]] || [[ "${_subcommand}" =~ ^(what|who|where|when|why|how|is|are|do|does|can|could|would|should) ]]
+      then
+        _ai_ask "${_subcommand}" "${@}"
+      else
+        _exit_1 printf "Unknown ai subcommand: %s\\nRun 'nb help ai' for usage information.\\n" "${_subcommand}"
+      fi
+      ;;
+  esac
+}
