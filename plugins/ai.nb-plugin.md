@@ -96,6 +96,9 @@ nb ai config set embedding_model "text-embedding-3-large"
 
 # Use a custom API endpoint (for OpenAI-compatible APIs)
 nb ai config set base_url "https://your-api-endpoint.com/v1"
+
+# Index scope: all notebooks or only the current one (default: all)
+nb ai config set scope "all"      # or "current"
 ```
 
 ### View Current Configuration
@@ -129,6 +132,8 @@ nb ai index --status
 # Force rebuild entire index
 nb ai index --rebuild
 ```
+
+**Scope:** By default, the index includes *all* of your notebooks. To limit to only the current notebook, set `nb ai config set scope current` (or pass `nb ai index --scope current`). To force all notebooks regardless of config, use `nb ai index --all`.
 
 **The index is stored in `~/.nb/.ai_index.json` and contains:**
 - Embeddings for each note (vector representation)
@@ -172,6 +177,8 @@ Results:
    Weekly Standup Notes
 ```
 
+Search runs against all indexed notebooks by default. To limit searches to the current notebook, set `nb ai config set scope current`.
+
 ### Ask Questions (RAG)
 
 Ask natural language questions and get AI-generated answers based on your notes:
@@ -186,6 +193,8 @@ nb ai ask "Summarize the project timeline" --model gpt-4o
 # Include more context notes
 nb ai ask "What is our deployment process?" -n 10
 ```
+
+By default, questions are answered using notes from *all* indexed notebooks. Set `nb ai config set scope current` if you prefer to restrict to the current notebook.
 
 **Example Output:**
 ```
